@@ -1,0 +1,105 @@
+version: 2
+references:
+  workspace_root: &workspace_root
+    /tmp/workspace
+
+  attach_workspace: &attach_workspace
+    attach_workspace:
+      at: *workspace_root
+
+version: 2
+jobs:
+  build:
+    machine:
+      enabled: true
+    steps:
+      - checkout
+      - run:
+          name: Build version tag
+          command: |
+            if [ "$CIRCLE_BRANCH" != "master" ]; then
+              echo 'export TAG=1.0.$CIRCLE_BUILD_NUM-$(echo $CIRCLE_BRANCH | tr "/" "-")' >> $BASH_ENV
+            else
+              echo 'export TAG=1.0.$CIRCLE_BUILD_NUM' >> $BASH_ENV
+            fi
+      - run:
+          name: Save version tag and environment to workspace
+          command: |
+            mkdir -p /tmp/workspace
+            echo "$TAG" > /tmp/workspace/tag
+            case $CIRCLE_BRANCH in
+              "master") ENVIRONMENT="staging";;
+              *) ENVIRONMENT="staging";;
+            esac
+            echo "$ENVIRONMENT" > /tmp/workspace/environment
+      - run:
+          name: Export environment variables
+          command: |
+            echo 'export ECR_REPO_PREFIX=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com' >> $BASH_ENV
+      - run:
+          name: Build docker container and push to ECR
+          command: |
+            eval $(aws ecr get-login --no-include-email --region $AWS_DEFAULT_REGION)
+            docker build --compress -t $ECR_REPO_PREFIX/$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME:$TAG -t $ECR_REPO_PREFIX/$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME:latest .
+            docker push $ECR_REPO_PREFIX/$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME:$TAG
+            docker push $ECR_REPO_PREFIX/$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME:latest
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - tag
+            - environment
+  deployment:
+    machine:
+      enabled: true
+    steps:
+      - checkout
+      - *attach_workspace
+      - run:
+          name: Export environment variables
+          command: |
+            echo 'export ECR_REPO_PREFIX=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com' >> $BASH_ENV
+            echo 'export TASK_NAME=$CIRCLE_PROJECT_REPONAME' >> $BASH_ENV
+            echo 'export ENVIRONMENT=$(cat /tmp/workspace/environment)' >> $BASH_ENV
+            echo 'export AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION' >> $BASH_ENV
+            echo 'export TAG=$(cat /tmp/workspace/tag)' >> $BASH_ENV
+      - run:
+          name: Install AWS CLI
+          command: |
+            pip install awscli
+      - run:
+          name: Register new ECS task definition
+          command: |
+            echo "Get the actual task definition"
+            TASK_DEF=$(aws ecs describe-task-definition --task-definition $CIRCLE_PROJECT_REPONAME --output json)
+            echo "Create new task definition"
+            FINAL_TASK=$(echo $TASK_DEF | jq '.taskDefinition|{family: .family, volumes: .volumes, containerDefinitions: .containerDefinitions}')
+            echo "Register new task definition"
+            UPDATED_TASK=$(aws ecs register-task-definition --cli-input-json "$(echo $FINAL_TASK)")
+            echo "Storing the Revision"
+            UPDATED_TASK_DEF_REVISION=$(echo $UPDATED_TASK | jq ".taskDefinition|.taskDefinitionArn")
+            echo "Updated task def revision: $UPDATED_TASK_DEF_REVISION"
+      - run:
+          name: Update ECS with new task definition
+          command: |
+            echo "Switch over to the new task definition by selecting the newest revision"
+            SUCCESS_UPDATE=$(aws ecs update-service --service $CIRCLE_PROJECT_REPONAME --task-definition $CIRCLE_PROJECT_REPONAME --cluster $CIRCLE_PROJECT_USERNAME-$ENVIRONMENT-ecs-cluster)
+workflows:
+  version: 2
+  test-build-deploy:
+    jobs:
+      - build:
+          filters:
+            branches:
+              only:
+                - master
+                - staging
+                - /ryan\/.*/
+                - /david\/.*/
+      - deployment:
+          filters:
+            branches:
+              only:
+                - master
+                - staging
+          requires:
+            - build
